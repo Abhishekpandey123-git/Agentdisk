@@ -57,6 +57,27 @@ fn version_and_help() {
 }
 
 #[test]
+fn config_reads_bom_prefixed_file() {
+    let h = tmp("config-bom");
+    let config_dir = h.join("agentdisk");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "\u{feff}worktree_days = 3\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&h, &["config"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("worktree_days = 3, build_days = 14, max_depth = 6"),
+        "{out}"
+    );
+    assert!(!err.contains("unknown key"), "{err}");
+    fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
 fn scan_finds_fake_agent_data_and_is_read_only() {
     let h = tmp("scan");
     fs::create_dir_all(h.join(".claude/projects/x")).unwrap();
@@ -119,6 +140,110 @@ fn apply_and_purge_refuse_without_a_terminal() {
     fs::remove_dir_all(&h).unwrap();
 }
 
+/// Write a quarantine journal by hand: (original, quarantine) pairs.
+fn write_journal(dir: &Path, entries: &[(&Path, &Path)]) {
+    use agentdisk_core::json::Value;
+    let v: Vec<Value> = entries
+        .iter()
+        .map(|(original, quarantine)| {
+            Value::obj(vec![
+                ("original", original.to_str().unwrap().into()),
+                ("quarantine", quarantine.to_str().unwrap().into()),
+                ("kind", "build-folder".into()),
+                ("bytes", 10u64.into()),
+                ("moved_at", 0u64.into()),
+                ("state", "quarantined".into()),
+            ])
+        })
+        .collect();
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("journal.json"), Value::Arr(v).pretty()).unwrap();
+}
+
+#[test]
+fn plans_lists_saved_plans_newest_first() {
+    let h = tmp("plans");
+    let (code, out, err) = run(&h, &["plans"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("No saved plans"), "{out}");
+    assert!(!h.join("agentdisk").exists(), "plans must not write");
+
+    for _ in 0..2 {
+        let (code, _, err) = run(&h, &["plan"]);
+        assert_eq!(code, 0, "{err}");
+    }
+    let dir = h.join("agentdisk/plans");
+    let made: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .map(|n| n.trim_end_matches(".json").to_string())
+        .collect();
+    assert_eq!(made.len(), 2, "{made:?}");
+
+    // A newer plan that was applied, and a file that is not a plan.
+    fs::write(
+        dir.join("20990101-abcdef.json"),
+        r#"{"id":"20990101-abcdef","created":4070908800,"items":[{"kind":"build-folder","path":"x","bytes":2048}]}"#,
+    )
+    .unwrap();
+    let q = h.join("agentdisk/quarantine/20990101-abcdef");
+    write_journal(&q, &[(&h.join("x"), &q.join("000-x"))]);
+    fs::write(dir.join("broken.json"), "{ nope").unwrap();
+    let before = fs::read_dir(&dir).unwrap().count();
+
+    let (code, out, err) = run(&h, &["plans"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 5, "{out}");
+    assert!(lines[1].contains("20990101-abcdef"), "{out}");
+    assert!(
+        lines[1].contains("applied (restore with: agentdisk restore 20990101-abcdef)"),
+        "{out}"
+    );
+    for id in &made {
+        let line = lines.iter().find(|l| l.contains(id.as_str())).unwrap();
+        assert!(line.contains("empty"), "{out}");
+    }
+    assert!(
+        lines[4].contains("broken") && lines[4].contains("unreadable"),
+        "{out}"
+    );
+
+    let (code, out, err) = run(&h, &["plans", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let v = agentdisk_core::json::parse(&out).unwrap();
+    assert_eq!(v.get("schema_version").unwrap().as_u64(), Some(1));
+    let plans = v.get("plans").unwrap().as_arr().unwrap();
+    assert_eq!(plans.len(), 4);
+    assert_eq!(plans[0].get("state").unwrap().as_str(), Some("applied"));
+    assert_eq!(plans[0].get("total_bytes").unwrap().as_u64(), Some(2048));
+    assert_eq!(plans[3].get("state").unwrap().as_str(), Some("unreadable"));
+
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+    fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn restore_and_purge_refuse_bad_plan_ids() {
+    let h = tmp("badid");
+    // A journal outside the quarantine folder, reachable as `../x`.
+    let stray = h.join("agentdisk/x/000-item");
+    fs::create_dir_all(&stray).unwrap();
+    let back = h.join("back");
+    write_journal(&h.join("agentdisk/x"), &[(&back, &stray)]);
+    for id in ["../x", "..\\x"] {
+        let (code, out, err) = run(&h, &["restore", id]);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(err.contains("bad plan id"), "{err}");
+        let (code, out, err) = run(&h, &["purge", "--plan", id, "--older-than", "0"]);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(err.contains("bad plan id"), "{err}");
+        assert!(!out.contains("deleted for good"), "{out}");
+    }
+    assert!(stray.exists() && !back.exists(), "nothing may move");
+    fs::remove_dir_all(&h).unwrap();
+}
+
 #[test]
 fn quarantine_json_and_options() {
     let h = tmp("quarantine");
@@ -165,47 +290,6 @@ fn quarantine_json_empty_is_stable() {
     let v = agentdisk_core::json::parse(out.trim()).unwrap();
     assert_eq!(v.get("schema_version").unwrap().as_u64(), Some(1));
     assert!(v.get("items").unwrap().as_arr().unwrap().is_empty());
-    fs::remove_dir_all(&h).unwrap();
-}
-
-/// Write a quarantine journal by hand: (original, quarantine) pairs.
-fn write_journal(dir: &Path, entries: &[(&Path, &Path)]) {
-    use agentdisk_core::json::Value;
-    let v: Vec<Value> = entries
-        .iter()
-        .map(|(original, quarantine)| {
-            Value::obj(vec![
-                ("original", original.to_str().unwrap().into()),
-                ("quarantine", quarantine.to_str().unwrap().into()),
-                ("kind", "build-folder".into()),
-                ("bytes", 10u64.into()),
-                ("moved_at", 0u64.into()),
-                ("state", "quarantined".into()),
-            ])
-        })
-        .collect();
-    fs::create_dir_all(dir).unwrap();
-    fs::write(dir.join("journal.json"), Value::Arr(v).pretty()).unwrap();
-}
-
-#[test]
-fn restore_and_purge_refuse_bad_plan_ids() {
-    let h = tmp("badid");
-    // A journal outside the quarantine folder, reachable as `../x`.
-    let stray = h.join("agentdisk/x/000-item");
-    fs::create_dir_all(&stray).unwrap();
-    let back = h.join("back");
-    write_journal(&h.join("agentdisk/x"), &[(&back, &stray)]);
-    for id in ["../x", "..\\x"] {
-        let (code, out, err) = run(&h, &["restore", id]);
-        assert_eq!(code, 2, "{out}{err}");
-        assert!(err.contains("bad plan id"), "{err}");
-        let (code, out, err) = run(&h, &["purge", "--plan", id, "--older-than", "0"]);
-        assert_eq!(code, 2, "{out}{err}");
-        assert!(err.contains("bad plan id"), "{err}");
-        assert!(!out.contains("deleted for good"), "{out}");
-    }
-    assert!(stray.exists() && !back.exists(), "nothing may move");
     fs::remove_dir_all(&h).unwrap();
 }
 
@@ -329,6 +413,81 @@ fn explain_command() {
     assert!(out.contains("Claude Code") && out.contains("keep"), "{out}");
     let (code, _, _) = run(&h, &["explain", h.join("nope").to_str().unwrap()]);
     assert_eq!(code, 2);
+    fs::remove_dir_all(&h).unwrap();
+}
+
+#[test]
+fn size_and_explain_with_several_folders() {
+    let h = tmp("several");
+    let (a, b, nope) = (h.join("a"), h.join("b"), h.join("nope"));
+    for d in [&a, &b] {
+        fs::create_dir_all(d).unwrap();
+        fs::write(d.join("f"), "hi").unwrap();
+    }
+    let s = |p: &PathBuf| p.to_str().unwrap().to_string();
+    let json = |v: &str| agentdisk_core::json::parse(v.trim()).unwrap();
+    for cmd in ["size", "explain"] {
+        let call = |dirs: &[&PathBuf], flags: &[&str]| {
+            let mut args = vec![cmd.to_string()];
+            args.extend(dirs.iter().map(|d| s(d)));
+            args.extend(flags.iter().map(|f| f.to_string()));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(&h, &args)
+        };
+
+        // One folder: a single object.
+        let (code, out, err) = call(&[&a], &["--json"]);
+        assert_eq!(code, 0, "{cmd}: {err}");
+        assert!(json(&out).get("path").is_some(), "{cmd}: {out}");
+
+        // Several: one array, in the order given.
+        let (code, out, err) = call(&[&b, &a], &["--json"]);
+        assert_eq!(code, 0, "{cmd}: {err}");
+        let v = json(&out);
+        let paths: Vec<&str> = v
+            .as_arr()
+            .unwrap()
+            .iter()
+            .map(|e| e.get("path").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 2, "{cmd}: {out}");
+        assert!(
+            paths[0].ends_with('b') && paths[1].ends_with('a'),
+            "{paths:?}"
+        );
+
+        // A missing folder in the middle is reported, the others still run.
+        let (code, out, _) = call(&[&a, &nope, &b], &["--json"]);
+        assert_eq!(code, 1, "{cmd}: {out}");
+        let v = json(&out);
+        let list = v.as_arr().unwrap();
+        assert_eq!(list.len(), 3, "{cmd}: {out}");
+        assert!(list[0].get("error").is_none() && list[2].get("error").is_none());
+        assert!(list[1].get("error").unwrap().as_str().is_some());
+        assert!(list[1]
+            .get("path")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .ends_with("nope"));
+
+        // Text: the error goes to stderr, the other folders still print.
+        let (code, out, err) = call(&[&a, &nope, &b], &[]);
+        assert_eq!(code, 1, "{cmd}: {out}{err}");
+        assert!(err.contains("nope"), "{cmd}: {err}");
+        // `explain` prints the canonical path, which can differ from the one
+        // given (short Windows temp names), so match on the folder name.
+        let printed = |n: &str| {
+            out.lines()
+                .any(|l| l.ends_with(&format!("/{n}")) || l.ends_with(&format!("\\{n}")))
+        };
+        assert!(printed("a") && printed("b"), "{cmd}: {out}");
+
+        // One missing folder keeps today's behaviour.
+        let (code, out, err) = call(&[&nope], &["--json"]);
+        assert_eq!(code, 2, "{cmd}: {out}{err}");
+        assert!(out.is_empty() && err.contains("nope"), "{cmd}: {out}{err}");
+    }
     fs::remove_dir_all(&h).unwrap();
 }
 
